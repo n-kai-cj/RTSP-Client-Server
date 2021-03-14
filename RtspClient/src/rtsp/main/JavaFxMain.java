@@ -16,7 +16,7 @@
 
 package rtsp.main;
 
-import javafx.application.Application;
+import javafx.application.Platform;
 import javafx.scene.Scene;
 import javafx.scene.canvas.Canvas;
 import javafx.scene.image.PixelFormat;
@@ -29,7 +29,7 @@ import rtsp.decode.SampleFFmpegH264Decoder;
 
 import java.nio.ByteBuffer;
 
-public class JavaFxMain extends Application {
+public class JavaFxMain {
 
     private final static int width = 640;
     private final static int height = 480;
@@ -37,13 +37,14 @@ public class JavaFxMain extends Application {
 
     private String serverIpAddr = "localhost";
     private int rtspServerPort = 5540;
+    private String rtsp_option = "";
 
-    @Override
-    public void start(Stage primaryStage) {
+    public void start() {
         final StackPane rootPane = new StackPane();
         final Canvas canvas = new Canvas(width, height);
         rootPane.getChildren().add(canvas);
         final Scene scene = new Scene(rootPane, width, height);
+        final Stage primaryStage = new Stage();
         primaryStage.setScene(scene);
 
         final PixelFormat<ByteBuffer> pf = PixelFormat.getByteRgbInstance();
@@ -62,7 +63,7 @@ public class JavaFxMain extends Application {
             }
         };
 
-        final RtspClient rtspClient = new RtspClient(serverIpAddr, rtspServerPort, videoCallback);
+        final RtspClient rtspClient = new RtspClient(serverIpAddr, rtspServerPort, rtsp_option, videoCallback);
         rtspClient.start();
 
         primaryStage.showingProperty().addListener((obs, ov, nv) -> {
@@ -76,7 +77,7 @@ public class JavaFxMain extends Application {
     }
 
     private void run(String[] args) {
-        for (String arg: args) {
+        for (String arg : args) {
             String[] split = arg.toLowerCase().split("=");
             if (split.length != 2) continue;
             try {
@@ -88,7 +89,7 @@ public class JavaFxMain extends Application {
             } catch (Exception ignored) {
             }
         }
-        launch(args);
+        Platform.startup(this::start);
     }
 
     public static void main(String[] args) {

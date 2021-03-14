@@ -19,6 +19,7 @@ package rtsp.client;
 import java.io.*;
 import java.net.*;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Timer;
 import java.util.TimerTask;
 
@@ -29,8 +30,14 @@ public class RtspClient implements Runnable {
     private DatagramPacket rcvdp;            //UDP packet received from the server
     private DatagramSocket RTPsocket;        //socket to be used to send and receive UDP packets
     private int RTP_RCV_PORT = 25000; //port where the client will receive the RTP packets
-
     private Timer timer; //timer used to receive data from the UDP socket
+
+    //RTCP variables:
+    //----------------
+    private DatagramSocket RTCPsocket;
+    private DatagramPacket rtcpPkt;
+    private int ssrc = 0;
+    private int lastSeq = 0;
 
     //RTSP variables
     //----------------
@@ -43,6 +50,7 @@ public class RtspClient implements Runnable {
     private InetAddress ServerIPAddr;
     private String ServerHost;
     private int RTSP_server_port;
+    private String rtsp_option;
 
     //input and output stream filters
     private BufferedReader RTSPBufferedReader;
@@ -61,17 +69,23 @@ public class RtspClient implements Runnable {
     //Video Callback:
     //------------------
     private RtspVideoCallback videoCallback;
-    private ByteBuffer videoByteBuffer = ByteBuffer.allocate(10 * 1024 * 1024);
-    private byte[] startCode = new byte[]{0, 0, 0, 1};
+    private final ByteBuffer videoByteBuffer = ByteBuffer.allocate(10 * 1024 * 1024);
+    private final byte[] startCode = new byte[]{0, 0, 0, 1};
 
+    private long lastVideoCallbackTimestamp = 0;
+    private int arrivalJitter = 0;
+    private short lost = 0;
+    private int cumulativeLost = 0;
+    private final Object lock = new Object();
 
-    public RtspClient(String serverIpAddr, int rtspServerPort, RtspVideoCallback videoCallback) {
-        initialize(serverIpAddr, rtspServerPort, videoCallback);
+    public RtspClient(String serverIpAddr, int rtspServerPort, String rtsp_option, RtspVideoCallback videoCallback) {
+        initialize(serverIpAddr, rtspServerPort, rtsp_option, videoCallback);
     }
 
-    private void initialize(String serverIpAddr, int rtspServerPort, RtspVideoCallback _videoCallback) {
+    private void initialize(String serverIpAddr, int rtspServerPort, String rtsp_option, RtspVideoCallback _videoCallback) {
         ServerHost = serverIpAddr;
         RTSP_server_port = rtspServerPort;
+        this.rtsp_option = rtsp_option;
         videoCallback = _videoCallback;
     }
 
@@ -120,7 +134,7 @@ public class RtspClient implements Runnable {
         //Construct a DatagramPacket to receive data from the UDP socket
         rcvdp = new DatagramPacket(buf, buf.length);
 
-        VideoFileName = String.format("rtsp://%s:%d/dumvideo.mp4/trackID=3", ServerHost, RTSP_server_port);
+        VideoFileName = String.format("rtsp://%s:%d%s", ServerHost, RTSP_server_port, rtsp_option);
         try {
             ServerIPAddr = InetAddress.getByName(ServerHost);
         } catch (UnknownHostException e) {
@@ -132,6 +146,7 @@ public class RtspClient implements Runnable {
         while (loopFlag && RTSPsocket == null) {
             try {
                 RTSPsocket = new Socket(ServerIPAddr, RTSP_server_port);
+                RTSPsocket.setSoTimeout(1000);
             } catch (IOException e) {
                 e.printStackTrace();
                 RTSPsocket = null;
@@ -155,6 +170,10 @@ public class RtspClient implements Runnable {
         state = INIT;
 
         // start rtsp client
+        if (!options()) {
+            System.out.println("options error");
+            return;
+        }
         if (!describe()) {
             System.out.println("describe error");
             return;
@@ -167,6 +186,10 @@ public class RtspClient implements Runnable {
 
         while (loopFlag) {
             sleep(1000);
+            if (!sendRR())
+                break;
+            if (!options())
+                break;
         }
 
         pause();
@@ -176,6 +199,23 @@ public class RtspClient implements Runnable {
             timer.cancel();
             timer = null;
         }
+    }
+
+    private boolean options() {
+
+        //increase RTSP sequence number
+        RTSPSeqNb++;
+
+        //Send OPTIONS message to the server
+        sendRequest("OPTIONS");
+
+        //Wait for the response
+        if (parseServerResponse() != 200) {
+            System.err.println("Invalid Server Response");
+            return false;
+        }
+
+        return true;
     }
 
     private boolean describe() {
@@ -217,9 +257,13 @@ public class RtspClient implements Runnable {
             sendRequest("SETUP");
 
             //Wait for the response
-            if (parseServerResponse() != 200) {
-                System.out.println("Invalid Server Response");
-                return false;
+            int res = parseServerResponse();
+            while (res != 200) {
+                if (res < 0) {
+                    System.out.println("Invalid Server Response");
+                    return false;
+                }
+                res = parseServerResponse();
             }
             //change RTSP state and print new state
             state = READY;
@@ -297,6 +341,69 @@ public class RtspClient implements Runnable {
 
     }
 
+    private boolean sendRR() {
+        if (RTCPsocket == null)
+            return false;
+        byte[] rr = new byte[1500];
+        String hostName;
+        try {
+            hostName = InetAddress.getLocalHost().getHostName();
+            if (hostName.length() > 15) hostName = hostName.substring(0, 15);
+        } catch (UnknownHostException e) {
+            e.printStackTrace();
+            return false;
+        }
+        int p = 0;
+        // RR: Receiver Report RTCP Packet
+        rr[p++] = (byte) 0x81; // version, padding, reception report count
+        rr[p++] = (byte) 0xc9; // packet type
+        short rr_header_len = 8;
+        shortToByte(rr_header_len - 1, rr, p); // header length - 1
+        p += 2;
+        intToByte(ssrc, rr, p); // SSRC
+        p += 4;
+        intToByte(ssrc - 1, rr, p); // CSRC
+        p += 4;
+        rr[p++] = (byte) lost; // fraction lost
+        intToThreeByte(cumulativeLost, rr, p); // cumulative number of packets lost
+        p += 3;
+        shortToByte(0, rr, p); // sequence number cycles count
+        p += 2;
+        shortToByte(lastSeq, rr, p); // highest sequence number received
+        p += 2;
+        intToByte(arrivalJitter, rr, p); // inter arrival jitter
+        p += 4;
+        intToByte(0, rr, p); // last SR timestamp
+        p += 4;
+        intToByte(0, rr, p); // delay since last SR timestamp
+        p += 4;
+        // SDES: Source Description RTCP Packet
+        rr[p++] = (byte) 0x81; // version, padding, source count
+        rr[p++] = (byte) 0xca; // packet type
+        short sdes_len = 28;
+        shortToByte(sdes_len / 4 - 1, rr, p); // SDES length 32-bit words minus one
+        p += 2;
+        intToByte(ssrc + 1, rr, p); // CSSRC
+        p += 4;
+        rr[p++] = 0x01; // CNAME
+        byte[] text = hostName.getBytes(StandardCharsets.UTF_8);
+        rr[p++] = (byte) text.length; // text length
+        System.arraycopy(text, 0, rr, p, text.length); // text
+        p += text.length;
+        for (; p < 32 + sdes_len; p++) {
+            rr[p] = 0;
+        }
+        rtcpPkt.setData(rr);
+        rtcpPkt.setLength(p);
+        try {
+            RTCPsocket.send(rtcpPkt);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return false;
+        }
+        return true;
+    }
+
     //------------------------------------
     //Handler for timer
     //------------------------------------
@@ -349,13 +456,12 @@ public class RtspClient implements Runnable {
                     }
                 } else {
                     // non fragmentation
+                    videoByteBuffer.clear();
                     videoByteBuffer.put(startCode, 0, startCode.length);
                     videoByteBuffer.put(payload, 0, payload_length);
 
-                    if ((payload[0] & 0x1f) == 1 || (payload[0] & 0x1f) == 2 || (payload[0] & 0x1f) == 3 || (payload[0] & 0x1f) == 4 || (payload[0] & 0x1f) == 5) {
-                        // video callback
-                        videoCallback(pt, seqNb, timestamp, rtp_packet.Ssrc);
-                    }
+                    // video callback
+                    videoCallback(pt, seqNb, timestamp, rtp_packet.Ssrc);
                 }
 
             } catch (InterruptedIOException iioe) {
@@ -363,6 +469,8 @@ public class RtspClient implements Runnable {
             } catch (IOException ioe) {
                 System.out.println("Exception caught: " + ioe);
             }
+            if (timer != null)
+                timer.schedule(new timerListener(), 0, 1);
         }
 
         private void videoCallback(int payloadType, int sequenceNumber, int timestamp, int ssrc) {
@@ -385,7 +493,11 @@ public class RtspClient implements Runnable {
         String StatusLine;
         try {
             do {
+                if (RTSPBufferedReader == null)
+                    break;
                 StatusLine = RTSPBufferedReader.readLine();
+                if (StatusLine == null)
+                    break;
                 //System.out.println("RTSP Client - Received from Server:");
                 //System.out.println(StatusLine);
 
@@ -398,11 +510,24 @@ public class RtspClient implements Runnable {
                     if (state == INIT && split[i].equals("Session:") && i + 1 < split.length) {
                         RTSPid = split[i + 1];
                     }
+                    // retrieve server port of source port of RTP and destination port of RTCP
+                    if (state == INIT && split[i].equals("Transport:") && i + 1 < split.length) {
+                        String[] ss = split[i + 1].split(";");
+                        for (String s : ss) {
+                            if (s.startsWith("server_port=")) {
+                                int rtcpPort = Integer.parseInt(s.substring(s.indexOf("-") + 1));
+                                //System.out.println("RTCP port - " + rtcpPort);
+                                RTCPsocket = new DatagramSocket();
+                                rtcpPkt = new DatagramPacket(new byte[1500], 100, new InetSocketAddress(ServerHost, rtcpPort));
+                            }
+                        }
+                    }
                 }
             } while (StatusLine.length() > 0);
 
         } catch (IOException e) {
             e.printStackTrace();
+            return -1;
         }
         return reply_code;
     }
@@ -412,6 +537,8 @@ public class RtspClient implements Runnable {
     //------------------------------------
 
     private void sendRequest(String request_type) {
+        if (RTSPBufferedWriter == null)
+            return;
         try {
             //Use the RTSPBufferedWriter to write to the RTSP socket
 
@@ -449,6 +576,24 @@ public class RtspClient implements Runnable {
             Thread.sleep(ms);
         } catch (InterruptedException ignored) {
         }
+    }
+
+    private void shortToByte(int val, byte[] dst, int start) {
+        dst[start] = (byte) ((val & 0xff00) >>> 8);
+        dst[start + 1] = (byte) (val & 0x00ff);
+    }
+
+    private void intToByte(int val, byte[] dst, int start) {
+        dst[start] = (byte) ((val & 0xff000000) >>> 24);
+        dst[start + 1] = (byte) ((val & 0x00ff0000) >>> 16);
+        dst[start + 2] = (byte) ((val & 0x0000ff00) >>> 8);
+        dst[start + 3] = (byte) (val & 0x000000ff);
+    }
+
+    private void intToThreeByte(int val, byte[] dst, int start) {
+        dst[start] = (byte) ((val & 0x00ff0000) >>> 16);
+        dst[start + 1] = (byte) ((val & 0x0000ff00) >>> 8);
+        dst[start + 2] = (byte) (val & 0x000000ff);
     }
 
 }
